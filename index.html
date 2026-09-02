@@ -122,6 +122,37 @@
     font-weight: 600;
     color: #C79A3D;
   }
+  .avail.none {
+    color: #A33D3D;
+  }
+  .card.claimed-out {
+    opacity: 0.55;
+  }
+  .claim-btn.disabled {
+    background: #B7AFA0;
+    cursor: default;
+    pointer-events: none;
+  }
+  .refresh-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 20px 4px;
+  }
+  .refresh-btn {
+    font-size: 11px;
+    padding: 5px 12px;
+    border-radius: 6px;
+    border: 1.5px solid #2C4A3E;
+    background: transparent;
+    color: #2C4A3E;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .refresh-status {
+    font-size: 11px;
+    color: #8A8371;
+  }
   .claim-btn {
     margin-top: 10px;
     width: 100%;
@@ -171,6 +202,11 @@
   <div class="cat-filters sans" id="catFilters"></div>
 </div>
 
+<div class="refresh-row sans">
+  <button class="refresh-btn" id="refreshBtn">Refresh availability</button>
+  <span class="refresh-status" id="refreshStatus"></span>
+</div>
+
 <div class="grid" id="grid"></div>
 <div class="empty-state sans" id="emptyState" style="display:none;">No items match your search.</div>
 
@@ -187,6 +223,77 @@
     params.set("usp", "pp_url");
     params.set(ITEM_FIELD_ENTRY_ID, item.name + " (" + item.size + ", " + item.color + ")");
     return GOOGLE_FORM_BASE_URL + "?" + params.toString();
+  }
+
+  // Published Google Sheet (form responses), read live to compute what's already claimed.
+  const CLAIMS_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRbKG2y0Y7tZbWoGBbugPPoXwaHTxD6wk2VgzH2_8yWT7miIbHQNcx_AI5JO0m2g0jce3OGmDryCzlZ/pub?gid=1228499951&single=true&output=csv";
+  let claimedMap = {}; // "Item name (size, color)" -> total qty claimed so far
+
+  function itemKey(item) {
+    return item.name + " (" + item.size + ", " + item.color + ")";
+  }
+
+  // Minimal CSV parser that handles quoted fields, embedded commas, and embedded newlines.
+  function parseCSV(text) {
+    const rows = [];
+    let row = [];
+    let field = "";
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else { inQuotes = false; }
+        } else {
+          field += c;
+        }
+      } else {
+        if (c === '"') { inQuotes = true; }
+        else if (c === ",") { row.push(field); field = ""; }
+        else if (c === "\r") { /* skip */ }
+        else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+        else { field += c; }
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows.filter(r => r.length > 1 || (r[0] && r[0].trim() !== ""));
+  }
+
+  function computeClaimsFromCSV(csvText) {
+    const rows = parseCSV(csvText);
+    if (rows.length < 2) return {};
+    const headers = rows[0].map(h => h.trim());
+    const itemIdx = headers.indexOf("Item");
+    const qtyIdx = headers.indexOf("Qty");
+    const result = {};
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      const itemVal = (r[itemIdx] || "").trim();
+      if (!itemVal) continue;
+      let qty = parseInt((r[qtyIdx] || "").trim(), 10);
+      if (!qty || qty < 1) qty = 1;
+      result[itemVal] = (result[itemVal] || 0) + qty;
+    }
+    return result;
+  }
+
+  async function fetchClaims(showStatus) {
+    const statusEl = document.getElementById("refreshStatus");
+    if (showStatus && statusEl) statusEl.textContent = "Checking latest claims…";
+    try {
+      const res = await fetch(CLAIMS_CSV_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error("bad response");
+      const text = await res.text();
+      claimedMap = computeClaimsFromCSV(text);
+      if (statusEl) {
+        const now = new Date();
+        statusEl.textContent = "Updated " + now.toLocaleTimeString();
+      }
+    } catch (e) {
+      if (statusEl) statusEl.textContent = "Couldn't refresh live claims — showing full inventory.";
+    }
+    renderGrid();
   }
 
   const categories = ["All", ...Array.from(new Set(ITEMS.map(i => i.category)))];
@@ -221,8 +328,11 @@
     emptyStateEl.style.display = visible.length === 0 ? "block" : "none";
 
     visible.forEach(item => {
+      const claimed = claimedMap[itemKey(item)] || 0;
+      const remaining = Math.max(0, item.qtyTotal - claimed);
+
       const card = document.createElement("div");
-      card.className = "card";
+      card.className = "card" + (remaining <= 0 ? " claimed-out" : "");
 
       const hole = document.createElement("div");
       hole.className = "tag-hole";
@@ -256,16 +366,16 @@
       card.appendChild(tags);
 
       const avail = document.createElement("div");
-      avail.className = "avail sans";
-      avail.textContent = item.qtyTotal + (item.qtyTotal === 1 ? " available" : " available");
+      avail.className = "avail sans" + (remaining <= 0 ? " none" : "");
+      avail.textContent = remaining <= 0 ? "Fully claimed" : remaining + " available";
       card.appendChild(avail);
 
       const claimBtn = document.createElement("a");
-      claimBtn.className = "claim-btn sans";
+      claimBtn.className = "claim-btn sans" + (remaining <= 0 ? " disabled" : "");
       claimBtn.href = claimUrl(item);
       claimBtn.target = "_blank";
       claimBtn.rel = "noopener";
-      claimBtn.textContent = "Claim";
+      claimBtn.textContent = remaining <= 0 ? "Fully claimed" : "Claim";
       card.appendChild(claimBtn);
 
       gridEl.appendChild(card);
@@ -277,8 +387,15 @@
     renderGrid();
   });
 
+  const refreshBtnEl = document.getElementById("refreshBtn");
+  if (refreshBtnEl) {
+    refreshBtnEl.addEventListener("click", () => fetchClaims(true));
+  }
+
   renderFilters();
   renderGrid();
+  fetchClaims(true);
+  setInterval(() => fetchClaims(false), 60000);
 </script>
 
 </body>
